@@ -434,6 +434,12 @@ pub async fn set_setting(
     if key == "normalize_volume" {
         state.reapply_gain().await;
     }
+    // Gesture-end volume commit (one per drag, keyboard settle or hotkey):
+    // lands a loudness step the player's drag throttle may have skipped.
+    // Step-gated inside, so commits inside the current step do nothing.
+    if key == "volume" {
+        state.sync_enhancer_loudness().await;
+    }
     // Psychoacoustic enhancer: same immediacy as normalize_volume, so the
     // master toggle, preset, sliders, output and A/B button are audible on
     // the track that's already playing, not the next one.

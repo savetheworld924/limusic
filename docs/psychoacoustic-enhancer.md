@@ -35,16 +35,45 @@ virtual bass → stereo → room → `asoftclip` → `alimiter(-1 dBFS)` → tri
 
 ## Level-matched A/B
 
-The chain carries a per-preset trim (`volume=-XdB`: Subtle −0.4, Warm −0.8,
-Wide −0.6, Reference −0.2) so enhanced lands within ~0.5 dB of bypass.
-Bypass rebuilds `af` to the plain gain+pitch chain (same path as the
-normalize toggle), so there is no loudness jump and no click in practice.
-If mpv refuses the full chain, the enhancer disables itself and restores
-gain+pitch — never silence, never crash.
+The chain carries a per-preset trim (`volume=±XdB`) so enhanced lands within
+±0.5 dB of bypass on every test signal. Bypass rebuilds `af` to the plain
+gain+pitch chain (same path as the normalize toggle), so there is no
+loudness jump and no click in practice. If mpv refuses the full chain, the
+enhancer disables itself and restores gain+pitch — never silence, never
+crash.
 
-Calibrate with ffmpeg: render pink noise + a music clip + a loud master
-through the chain vs bypass, compare integrated loudness with `ebur128` or
-`astats`, adjust `preset_trim_db()` in `crates/player/src/enhancer.rs`.
+### Calibration (2026-10-07, ffmpeg 8.1 gyan.dev full build)
+
+Method (`target/cal/` scripts, kept out of the repo): exact builder chains
+at volume 80 (printed by a `rustc` helper including `enhancer.rs`, so no
+transcription drift), trim stripped, rendered over three 12 s / 48 kHz
+stereo signals — uncorrelated pink noise (two seeds merged), a loud detuned
+chord mix (`loudnorm` I=-8 LUFS) and the same chord at −15 dB — measured
+with `ebur128` integrated loudness. Trim = −mean delta, then a verify pass
+*with* trims:
+
+| preset    | pink | loud | quiet | residuals after trim (dB) |
+|-----------|------|------|-------|---------------------------|
+| Subtle −0.5    | +0.6 | +0.1 | +0.8 | +0.1, −0.4, +0.3 |
+| Warm −0.2      | +0.5 | −0.2 | +0.4 | +0.3, −0.4, +0.2 |
+| Wide −0.6      | +0.9 | +0.1 | +0.8 | +0.3, −0.5, +0.2 |
+| Reference +0.3 | −0.3 | −0.6 |  0.0 | 0.0, −0.3, +0.3 |
+
+Two systematic losses were fixed at the source instead of trimmed:
+`aecho` unity I/O (its 0.8/0.9 gains cost ~2.8 dB) and `crossfeed` unity I/O
+(its `level_in=0.9` default costs ~1.7 dB on wide material); the end limiter
+owns clipping. Adjust `preset_trim_db()` in `crates/player/src/enhancer.rs`
+if the chain changes, and re-run the verify pass.
+
+Caveats: trims are calibrated on the speakers path at volume 80 (where the
+1 dB-quantized loudness comp is 0 for all presets). At quiet volumes the
+loudness comp intentionally lifts bass/treble — that is its purpose, not a
+mismatch. Headphones mode is wider-tolerance by nature: `crossfeed` is
+signal-dependent (measured −0.2…−1.7 dB no-trim on synthetic uncorrelated /
+beating signals; much less on correlated real music, where lows are
+centered and crossfeed's ~1.5–2 kHz range has little side energy). If
+headphones A/B needs the same ±0.5 dB guarantee on pathological material,
+per-output trims are the follow-up (settings model change, not done).
 
 ## Presets
 
@@ -78,9 +107,10 @@ weak laptop.
 ## Files
 
 - `crates/player/src/enhancer.rs` — chain builder, presets, trims, caps, tests.
-- `crates/player/src/lib.rs` — `Player::{enhancer,set_enhancer,
-  set_enhancer_bypass,probe_enhancer_filters,apply_af,full_af_chain}`,
-  volume-throttled re-apply.
+- `crates/player/src/lib.rs` — `Player::{set_enhancer,
+  sync_enhancer_loudness,probe_enhancer_filters,apply_af,full_af_chain}`,
+  1 dB-quantized loudness gate + `af-command` attempt with throttled rebuild
+  fallback, 250 ms throttle, forced settle on volume commit.
 - `src-tauri/src/commands.rs` — 5 `UI_SETTINGS` keys + immediate apply.
 - `src-tauri/src/state.rs` — `load_enhancer_settings`,
   `parse_enhancer_amounts`, `enhancer_amounts_json`, `apply_enhancer`.

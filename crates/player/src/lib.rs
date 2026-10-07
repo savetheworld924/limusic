@@ -15,8 +15,8 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 mod enhancer;
 pub use enhancer::{
-    build_enhancer_af, loudness_compensation_db, preset_trim_db, EnhancerAmounts, EnhancerOutput,
-    EnhancerPresetName, EnhancerSettings, FilterCaps,
+    build_enhancer_af, loudness_compensation_db, preset_trim_db, quantize_1db, EnhancerAmounts,
+    EnhancerOutput, EnhancerPresetName, EnhancerSettings, FilterCaps,
 };
 mod video;
 pub use video::{GlDisplay, Thumbnail, VideoRenderer};
@@ -122,9 +122,12 @@ pub struct Player {
     /// keep working: the idle deck inherits `af` via `INHERITED`.
     enhancer: Mutex<EnhancerSettings>,
     enhancer_caps: Mutex<FilterCaps>,
-    /// Last loudness-comp re-apply, so `set_volume` drags retune at most
-    /// ~10/s instead of rebuilding the chain every frame.
+    /// Last loudness-comp re-apply, so `set_volume` drags rebuild at most
+    /// ~4/s instead of every frame (see `quantize_1db` + 250 ms throttle).
     enhancer_last_apply: Mutex<std::time::Instant>,
+    /// Last applied loudness step `(bass dB, treble dB)`, quantized to 1 dB.
+    /// When the drag stays inside one step the `af` chain is never touched.
+    enhancer_last_loudness: Mutex<(i32, i32)>,
 }
 
 /// One mpv instance plays one file at a time, so an *overlap* needs a second decoder and a second
@@ -367,6 +370,7 @@ impl Player {
             enhancer: Mutex::new(EnhancerSettings::default()),
             enhancer_caps: Mutex::new(FilterCaps::all()),
             enhancer_last_apply: Mutex::new(std::time::Instant::now()),
+            enhancer_last_loudness: Mutex::new((i32::MIN, i32::MIN)),
         };
         // Probe once at startup: a missing ffmpeg filter drops its stage
         // (or its documented fallback) instead of failing the whole chain.
@@ -622,23 +626,39 @@ impl Player {
         // Remembered because a crossfade scales it on both decks, and because the deck that
         // fades in is not the one this was last set on.
         self.decks.volume.store(volume, Ordering::Relaxed);
-        // Loudness compensation follows the slider. Throttled: a drag calls
-        // this every frame and each `af` set rebuilds mpv's filter graph.
-        if self.enhancer.lock().unwrap().enabled {
-            let now = std::time::Instant::now();
-            let last = *self.enhancer_last_apply.lock().unwrap();
-            let due = match now.checked_duration_since(last) {
-                None => true,
-                Some(d) => d.as_millis() >= 100,
-            };
-            if due {
-                *self.enhancer_last_apply.lock().unwrap() = now;
-                // Best-effort: the volume already moved; a refused enhancer
-                // chain must never fail the slider.
-                if let Err(e) = self.apply_af() {
-                    tracing::warn!(error = %e, "enhancer loudness re-apply failed");
-                }
+        // Loudness compensation follows the slider, in 1 dB steps: most
+        // frames of a drag land inside the current step and never touch `af`
+        // at all. A step change first tries an in-place `af-command` retune
+        // (no graph rebuild); only its failure rebuilds, throttled to one
+        // reinit per 250 ms. The gesture-end commit (`set_setting('volume')`)
+        // forces the trailing sync, so a throttled step still lands.
+        if !self.enhancer.lock().unwrap().enabled {
+            return Ok(());
+        }
+        let step = self.quantized_loudness_step();
+        if step == *self.enhancer_last_loudness.lock().unwrap() {
+            return Ok(());
+        }
+        if self.try_loudness_af_command(step) {
+            *self.enhancer_last_loudness.lock().unwrap() = step;
+            *self.enhancer_last_apply.lock().unwrap() = std::time::Instant::now();
+            return Ok(());
+        }
+        let now = std::time::Instant::now();
+        let last = *self.enhancer_last_apply.lock().unwrap();
+        let due = match now.checked_duration_since(last) {
+            None => true,
+            Some(d) => d.as_millis() >= 250,
+        };
+        if due {
+            // Best-effort: the volume already moved; a refused enhancer
+            // chain must never fail the slider.
+            if let Err(e) = self.apply_af() {
+                tracing::warn!(error = %e, "enhancer loudness re-apply failed");
+            } else {
+                *self.enhancer_last_loudness.lock().unwrap() = step;
             }
+            *self.enhancer_last_apply.lock().unwrap() = now;
         }
         Ok(())
     }
@@ -732,29 +752,71 @@ impl Player {
         Ok(())
     }
 
-    /// Current enhancer state (copy).
-    pub fn enhancer(&self) -> EnhancerSettings {
-        *self.enhancer.lock().unwrap()
-    }
-
     /// Replace the enhancer state and re-apply the chain. OFF by default;
     /// enabling probes nothing (probed once at startup) and never silences:
     /// if mpv refuses the full chain the enhancer is disabled and the
-    /// previous gain+pitch chain is restored.
+    /// previous gain+pitch chain is restored. A/B bypass rides this too
+    /// (via `EnhancerSettings.bypass`), which rebuilds `af` like the
+    /// normalize toggle does: mpv reinits the graph, click-free in practice
+    /// with `latency=1` limiters keeping gapless intact.
     pub fn set_enhancer(&self, settings: EnhancerSettings) -> Result<(), Error> {
         *self.enhancer.lock().unwrap() = settings;
+        let res = self.apply_af();
+        if res.is_ok() {
+            // What's playing is what `last` says, so the next drag compares
+            // against the fresh chain instead of rebuilding once for free.
+            *self.enhancer_last_loudness.lock().unwrap() = self.quantized_loudness_step();
+        }
         *self.enhancer_last_apply.lock().unwrap() = std::time::Instant::now();
-        self.apply_af()
+        res
     }
 
-    /// A/B bypass. Keeps the same loudness by design (the enabled chain
-    /// carries its preset trim so it lands within ~0.5 dB of bypass) and
-    /// switches by rebuilding `af` like the normalize toggle does: mpv
-    /// reinits the graph, which is click-free in practice with `latency=1`
-    /// limiters keeping gapless intact.
-    pub fn set_enhancer_bypass(&self, bypass: bool) -> Result<(), Error> {
-        self.enhancer.lock().unwrap().bypass = bypass;
-        self.apply_af()
+    /// Forced loudness sync without the drag throttle: the trailing edge for
+    /// gesture-end commits. The UI persists the volume once per gesture via
+    /// `set_setting('volume')`, which routes here through the app state's
+    /// `sync_enhancer_loudness`, so a step change skipped mid-drag for the
+    /// 250 ms throttle still lands on release.
+    pub fn sync_enhancer_loudness(&self) -> Result<(), Error> {
+        if !self.enhancer.lock().unwrap().enabled {
+            return Ok(());
+        }
+        let step = self.quantized_loudness_step();
+        if step == *self.enhancer_last_loudness.lock().unwrap() {
+            return Ok(());
+        }
+        if self.try_loudness_af_command(step) {
+            *self.enhancer_last_loudness.lock().unwrap() = step;
+            *self.enhancer_last_apply.lock().unwrap() = std::time::Instant::now();
+            return Ok(());
+        }
+        self.apply_af()?;
+        *self.enhancer_last_loudness.lock().unwrap() = step;
+        *self.enhancer_last_apply.lock().unwrap() = std::time::Instant::now();
+        Ok(())
+    }
+
+    /// Current loudness step `(bass dB, treble dB)`, quantized to 1 dB.
+    fn quantized_loudness_step(&self) -> (i32, i32) {
+        let enh = *self.enhancer.lock().unwrap();
+        let vol = self.decks.volume.load(Ordering::Relaxed);
+        let (b, t) = enhancer::loudness_compensation_db(vol, enh.amounts.loudness);
+        (quantize_1db(b) as i32, quantize_1db(t) as i32)
+    }
+
+    /// Best-effort in-place retune of the labeled loudness shelves, without
+    /// rebuilding mpv's filter graph. Returns whether both landed.
+    ///
+    /// This is the runtime probe for `af-command` on direct (non-`lavfi`)
+    /// filters: mpv's manual routes `af-command` to `lavfi` only, so current
+    /// builds are expected to refuse these and the `false` below sends the
+    /// caller to the throttled rebuild. If a future libmpv accepts them,
+    /// loudness follows the slider with no reinit at all.
+    fn try_loudness_af_command(&self, step: (i32, i32)) -> bool {
+        let mpv = self.mpv();
+        mpv.command("af-command", &["@enh_loud_bass", "gain", &format!("{}", step.0)]).is_ok()
+            && mpv
+                .command("af-command", &["@enh_loud_treble", "gain", &format!("{}", step.1)])
+                .is_ok()
     }
 
     /// Probe each ffmpeg filter once by setting a minimal `af` and reading
@@ -773,7 +835,7 @@ impl Player {
             ("virtualbass", "virtualbass=cutoff=120:strength=1.5"),
             ("crossfeed", "crossfeed=strength=0.25:range=0.5"),
             ("stereotools", "stereotools=slev=1.2"),
-            ("aecho", "aecho=in_gain=0.8:out_gain=0.9:delays=12|24|32:decays=0.05|0.04|0.03"),
+            ("aecho", "aecho=in_gain=1.0:out_gain=1.0:delays=12|24|32:decays=0.05|0.04|0.03"),
             ("alimiter", "alimiter=limit=0.89:level=disabled:asc=1:latency=1"),
             ("asoftclip", "asoftclip=type=tanh:threshold=0.89:output=1"),
         ];

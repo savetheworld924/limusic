@@ -25,8 +25,9 @@
 //! - `volume=..dB` trim for level matching.
 //!
 //! mpv `af` entry syntax: `[@label:]filter[=params]`, params joined by `:`,
-//! filters joined by `,`. Labels (`@enh_loud_bass:`) are for future
-//! `af-command` loudness updates without rebuilding the chain.
+//! filters joined by `,`. Labels (`@enh_loud_bass:`) let the player try an
+//! in-place `af-command` retune first; when mpv refuses it (direct filters,
+//! not `lavfi`) the player falls back to a throttled chain rebuild.
 
 /// Headphone vs speaker stereo handling.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -42,13 +43,6 @@ impl EnhancerOutput {
         match s {
             "headphones" => EnhancerOutput::Headphones,
             _ => EnhancerOutput::Speakers,
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            EnhancerOutput::Headphones => "headphones",
-            EnhancerOutput::Speakers => "speakers",
         }
     }
 }
@@ -69,15 +63,6 @@ impl EnhancerPresetName {
             "Wide" => EnhancerPresetName::Wide,
             "Reference" => EnhancerPresetName::Reference,
             _ => EnhancerPresetName::Subtle,
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            EnhancerPresetName::Subtle => "Subtle",
-            EnhancerPresetName::Warm => "Warm",
-            EnhancerPresetName::Wide => "Wide",
-            EnhancerPresetName::Reference => "Reference",
         }
     }
 }
@@ -246,16 +231,29 @@ impl FilterCaps {
 }
 
 /// Loudness-neutral trim per preset (dB, applied at the end via `volume`).
-/// Calibrated by design to keep integrated loudness within ~0.5 dB of
-/// bypass; refine with an `ebur128`/`astats` pass over pink noise + music
-/// (see docs/psychoacoustic-enhancer.md). Negative: the chain adds a
-/// little energy (exciter harmonics, bass, widening) so it is pulled back.
+///
+/// Calibrated 2026-10-07 with ffmpeg 8.1 `ebur128` (integrated loudness) at
+/// volume 80 over three 12 s stereo signals — uncorrelated pink noise, a
+/// loud detuned chord mix (I=-8 LUFS) and the same chord at -15 dB:
+///
+/// | preset    | pink | loud | quiet | mean | trim |
+/// |-----------|------|------|-------|------|------|
+/// | Subtle    | +0.6 | +0.1 |  +0.8 | +0.5 | -0.5 |
+/// | Warm      | +0.5 | -0.2 |  +0.4 | +0.2 | -0.2 |
+/// | Wide      | +0.9 | +0.1 |  +0.8 | +0.6 | -0.6 |
+/// | Reference | -0.3 | -0.6 |   0.0 | -0.3 | +0.3 |
+///
+/// Residuals after trim are all within 0.5 dB per signal. Two fixes fell out
+/// of the measurement: `aecho` unity I/O (its 0.8/0.9 gains cost ~2.8 dB)
+/// and `crossfeed` unity I/O (its level_in=0.9 default costs ~1.7 dB on wide
+/// material). Headphones mode stays wider-tolerance by nature — crossfeed is
+/// signal-dependent — see docs/psychoacoustic-enhancer.md.
 pub fn preset_trim_db(preset: EnhancerPresetName) -> f32 {
     match preset {
-        EnhancerPresetName::Subtle => -0.4,
-        EnhancerPresetName::Warm => -0.8,
+        EnhancerPresetName::Subtle => -0.5,
+        EnhancerPresetName::Warm => -0.2,
         EnhancerPresetName::Wide => -0.6,
-        EnhancerPresetName::Reference => -0.2,
+        EnhancerPresetName::Reference => 0.3,
     }
 }
 
@@ -273,6 +271,17 @@ pub fn loudness_compensation_db(volume_percent: i64, amount: f32) -> (f32, f32) 
     let t = (1.0 - v).clamp(0.0, 1.0);
     let curve = t.powf(1.5);
     (6.0 * curve * a, 4.0 * curve * a)
+}
+
+/// Round a gain to 1 dB steps. Non-finite in → 0.0 out (never NaN in `af`).
+/// The loudness shelves move in these steps so a volume drag retunes a few
+/// times instead of every frame, and equal steps compare equal so the player
+/// can skip the `af` rebuild entirely when nothing audible changed.
+pub fn quantize_1db(v: f32) -> f32 {
+    if !v.is_finite() {
+        return 0.0;
+    }
+    v.round()
 }
 
 fn fmt_db(v: f32) -> String {
@@ -315,9 +324,13 @@ pub fn build_enhancer_af(
         parts.push("highpass=frequency=20:poles=2".to_owned());
     }
 
-    // 2. Loudness compensation, labeled for future af-command updates.
+    // 2. Loudness compensation, labeled for in-place af-command updates.
+    // Quantized to 1 dB: a full-slider drag crosses ~4 steps, so the chain
+    // is rebuilt a few times per gesture at most, never per frame.
     {
         let (bass_db, treble_db) = loudness_compensation_db(volume_percent, amt.loudness);
+        let bass_db = quantize_1db(bass_db);
+        let treble_db = quantize_1db(treble_db);
         if bass_db >= 0.05 && caps.bass {
             parts.push(format!("@enh_loud_bass:bass=gain={}:frequency=120", fmt_db(bass_db)));
         }
@@ -376,8 +389,13 @@ pub fn build_enhancer_af(
         match settings.output {
             EnhancerOutput::Headphones => {
                 if caps.crossfeed {
+                    // Explicit unity I/O: the defaults (level_in=0.9) cost
+                    // ~1.7 dB on wide material (measured 2026-10-07). The end
+                    // limiter owns clipping instead.
                     let s = 0.2 + 0.15 * amt.stereo;
-                    parts.push(format!("crossfeed=strength={s:.2}:range=0.5"));
+                    parts.push(format!(
+                        "crossfeed=strength={s:.2}:range=0.5:level_in=1.0:level_out=1.0"
+                    ));
                 }
                 if caps.stereotools {
                     let slev = 1.0 + 0.15 * amt.stereo;
@@ -394,13 +412,16 @@ pub fn build_enhancer_af(
     }
 
     // 7. Room: very subtle early reflections, off in Subtle (room == 0).
+    // Unity gains: measured 2026-10-07 (ffmpeg ebur128) that in_gain=0.8 /
+    // out_gain=0.9 attenuate the dry signal ~2.8 dB, which no trim should
+    // have to buy back. Only the tiny decays add anything (<0.1 dB).
     if amt.room > 0.0 && caps.aecho {
         let base = 0.03 + 0.05 * amt.room;
         let d1 = base;
         let d2 = base * 0.8;
         let d3 = base * 0.6;
         parts.push(format!(
-            "aecho=in_gain=0.8:out_gain=0.9:delays=12|24|32:decays={d1:.3}|{d2:.3}|{d3:.3}"
+            "aecho=in_gain=1.0:out_gain=1.0:delays=12|24|32:decays={d1:.3}|{d2:.3}|{d3:.3}"
         ));
     }
 
@@ -457,7 +478,7 @@ mod tests {
         assert!(af.contains("alimiter=limit=0.89"), "{}", af);
         assert!(af.contains("asoftclip=type=tanh"), "{}", af);
         assert!(!af.contains("aecho"), "Subtle room is 0, must not smear: {}", af);
-        assert!(af.contains("volume=-0.4dB"), "level trim missing: {}", af);
+        assert!(af.contains("volume=-0.5dB"), "level trim missing: {}", af);
     }
 
     #[test]
@@ -551,6 +572,40 @@ mod tests {
                 assert!(!af.starts_with(',') && !af.ends_with(','), "{}", af);
             }
         }
+    }
+
+    #[test]
+    fn loudness_is_quantized_to_1db_steps() {
+        assert_eq!(quantize_1db(2.12), 2.0);
+        assert_eq!(quantize_1db(2.5), 3.0);
+        assert_eq!(quantize_1db(0.0), 0.0);
+        assert_eq!(quantize_1db(f32::NAN), 0.0);
+        assert_eq!(quantize_1db(f32::INFINITY), 0.0);
+        // The builder only ever emits integer loudness gains: a drag that
+        // stays inside one step rebuilds nothing.
+        let mut s = on();
+        s.amounts = EnhancerAmounts {
+            loudness: 1.0,
+            polish: 0.0,
+            exciter: 0.0,
+            virtual_bass: 0.0,
+            stereo: 0.0,
+            room: 0.0,
+        };
+        for vol in [0, 10, 20, 30, 40, 50, 60, 70, 80, 90] {
+            let af = build_enhancer_af(&s, vol, &FilterCaps::all());
+            for token in af.split(',') {
+                if let Some(g) = token.split("gain=").nth(1) {
+                    let db: f32 = g.split(':').next().unwrap_or("x").parse().unwrap();
+                    assert_eq!(db, db.round(), "non-integer loudness gain at vol={vol}: {token}");
+                }
+            }
+        }
+        // Adjacent volumes share a step mid-slider (bass 2.1→2.1 dB):
+        // no rebuild while dragging inside it.
+        let a50 = build_enhancer_af(&s, 50, &FilterCaps::all());
+        let a51 = build_enhancer_af(&s, 51, &FilterCaps::all());
+        assert_eq!(a50, a51);
     }
 
     #[test]

@@ -3347,6 +3347,16 @@ impl AppState {
         self.player.set_crossfade(secs);
     }
 
+    /// Trailing edge for volume-drag loudness: `set_setting('volume')` fires
+    /// once per gesture (the UI's commit), so a loudness step skipped by the
+    /// player's 250 ms drag throttle still lands on release. Step-gated, so
+    /// a commit inside the current step is a no-op.
+    pub async fn sync_enhancer_loudness(&self) {
+        if let Err(e) = self.player.sync_enhancer_loudness() {
+            tracing::warn!(error = %e, "enhancer loudness settle failed");
+        }
+    }
+
     /// Put the persisted enhancer settings on the player, effective on what
     /// is already playing (like `reapply_gain`, unlike crossfade). Every
     /// `enhancer_*` writer in `set_setting` routes through here. Never fails
@@ -4392,14 +4402,15 @@ pub fn load_enhancer_settings(db: &Db) -> EnhancerSettings {
         EnhancerOutput::parse(db.get_setting("enhancer_output").as_deref().unwrap_or("speakers"));
     let amounts = db
         .get_setting("enhancer_amounts")
-        .and_then(|s| parse_enhancer_amounts(&s, preset))
+        .and_then(|s| parse_enhancer_amounts(&s))
         .unwrap_or_else(|| EnhancerAmounts::from_preset(preset));
     EnhancerSettings { enabled, bypass: false, preset, amounts, output }
 }
 
 /// Parse the `enhancer_amounts` JSON blob (`{"loudness":0.6,...}`).
 /// Returns `None` on any shape error so the caller falls back to presets.
-fn parse_enhancer_amounts(s: &str, preset: EnhancerPresetName) -> Option<EnhancerAmounts> {
+/// The blob carries its own values, so no preset context is needed.
+fn parse_enhancer_amounts(s: &str) -> Option<EnhancerAmounts> {
     let v: serde_json::Value = serde_json::from_str(s).ok()?;
     let o = v.as_object()?;
     let num = |k: &str| o.get(k).and_then(serde_json::Value::as_f64).map(|x| x as f32);
@@ -4415,26 +4426,6 @@ fn parse_enhancer_amounts(s: &str, preset: EnhancerPresetName) -> Option<Enhance
         }
         .sanitized(),
     )
-    .filter(|_| {
-        // Guard against a preset rename leaving a stale blob behind: the
-        // blob is still usable (it carries its own values), so accept it.
-        let _ = preset;
-        true
-    })
-}
-
-/// Serialize amounts for `set_setting("enhancer_amounts", …)`. Used by tests
-/// and (via the UI) when a preset is picked.
-pub fn enhancer_amounts_json(a: &EnhancerAmounts) -> String {
-    serde_json::json!({
-        "loudness": a.loudness,
-        "polish": a.polish,
-        "exciter": a.exciter,
-        "virtual_bass": a.virtual_bass,
-        "stereo": a.stereo,
-        "room": a.room,
-    })
-    .to_string()
 }
 
 /// How far into a track a play counts (context/01 §registerPlayback): halfway, capped at 30s.
