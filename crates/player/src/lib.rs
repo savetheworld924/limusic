@@ -13,6 +13,11 @@ use libmpv2::mpv_node::MpvNode;
 use libmpv2::{Format, Mpv};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
+mod enhancer;
+pub use enhancer::{
+    build_enhancer_af, EnhancerAmounts, EnhancerOutput, EnhancerPresetName, EnhancerSettings,
+    FilterCaps, loudness_compensation_db, preset_trim_db,
+};
 mod video;
 pub use video::{GlDisplay, Thumbnail, VideoRenderer};
 
