@@ -117,6 +117,14 @@ pub struct Player {
     /// that write to it have to be re-applied together: a bare `set_property("af", ...)` from
     /// either one would drop the other's filter.
     af: Mutex<(Option<f64>, i32)>,
+    /// Psychoacoustic enhancer (Phase 1-2). OFF by default. Merged into `af`
+    /// by [`Self::apply_af`] between gain and pitch, so gapless/crossfade
+    /// keep working: the idle deck inherits `af` via `INHERITED`.
+    enhancer: Mutex<EnhancerSettings>,
+    enhancer_caps: Mutex<FilterCaps>,
+    /// Last loudness-comp re-apply, so `set_volume` drags retune at most
+    /// ~10/s instead of rebuilding the chain every frame.
+    enhancer_last_apply: Mutex<std::time::Instant>,
 }
 
 /// One mpv instance plays one file at a time, so an *overlap* needs a second decoder and a second
@@ -352,7 +360,20 @@ impl Player {
             wid: AtomicI64::new(0),
         });
         spawn_deck_events(&a, 0, decks.clone())?;
-        Ok(Player { decks, events: Some(rx), af: Mutex::new((None, 0)) })
+        let player = Player {
+            decks,
+            events: Some(rx),
+            af: Mutex::new((None, 0)),
+            enhancer: Mutex::new(EnhancerSettings::default()),
+            enhancer_caps: Mutex::new(FilterCaps::all()),
+            enhancer_last_apply: Mutex::new(std::time::Instant::now()),
+        };
+        // Probe once at startup: a missing ffmpeg filter drops its stage
+        // (or its documented fallback) instead of failing the whole chain.
+        // Best-effort and silent-safe: probing runs before any file is
+        // loaded, and restores the empty chain afterwards.
+        player.probe_enhancer_filters();
+        Ok(player)
     }
 
     /// The deck the app is hearing. Every command below acts on this one.
@@ -601,6 +622,24 @@ impl Player {
         // Remembered because a crossfade scales it on both decks, and because the deck that
         // fades in is not the one this was last set on.
         self.decks.volume.store(volume, Ordering::Relaxed);
+        // Loudness compensation follows the slider. Throttled: a drag calls
+        // this every frame and each `af` set rebuilds mpv's filter graph.
+        if self.enhancer.lock().unwrap().enabled {
+            let now = std::time::Instant::now();
+            let last = *self.enhancer_last_apply.lock().unwrap();
+            let due = match now.checked_duration_since(last) {
+                None => true,
+                Some(d) => d.as_millis() >= 100,
+            };
+            if due {
+                *self.enhancer_last_apply.lock().unwrap() = now;
+                // Best-effort: the volume already moved; a refused enhancer
+                // chain must never fail the slider.
+                if let Err(e) = self.apply_af() {
+                    tracing::warn!(error = %e, "enhancer loudness re-apply failed");
+                }
+            }
+        }
         Ok(())
     }
 
@@ -693,11 +732,137 @@ impl Player {
         Ok(())
     }
 
+    /// Current enhancer state (copy).
+    pub fn enhancer(&self) -> EnhancerSettings {
+        *self.enhancer.lock().unwrap()
+    }
+
+    /// Replace the enhancer state and re-apply the chain. OFF by default;
+    /// enabling probes nothing (probed once at startup) and never silences:
+    /// if mpv refuses the full chain the enhancer is disabled and the
+    /// previous gain+pitch chain is restored.
+    pub fn set_enhancer(&self, settings: EnhancerSettings) -> Result<(), Error> {
+        *self.enhancer.lock().unwrap() = settings;
+        *self.enhancer_last_apply.lock().unwrap() = std::time::Instant::now();
+        self.apply_af()
+    }
+
+    /// A/B bypass. Keeps the same loudness by design (the enabled chain
+    /// carries its preset trim so it lands within ~0.5 dB of bypass) and
+    /// switches by rebuilding `af` like the normalize toggle does: mpv
+    /// reinits the graph, which is click-free in practice with `latency=1`
+    /// limiters keeping gapless intact.
+    pub fn set_enhancer_bypass(&self, bypass: bool) -> Result<(), Error> {
+        self.enhancer.lock().unwrap().bypass = bypass;
+        self.apply_af()
+    }
+
+    /// Probe each ffmpeg filter once by setting a minimal `af` and reading
+    /// success back. Missing filters drop their stage (see enhancer.rs).
+    /// Restores the empty chain afterwards; never fails the player.
+    fn probe_enhancer_filters(&self) {
+        // (filter key, minimal af to try). Keep each a single filter so a
+        // refusal names its stage unambiguously.
+        let probes: &[(&str, &str)] = &[
+            ("aformat", "aformat=sample_fmts=fltp"),
+            ("highpass", "highpass=frequency=20:poles=2"),
+            ("bass", "bass=gain=2:frequency=120"),
+            ("treble", "treble=gain=2:frequency=9000"),
+            ("equalizer", "equalizer=frequency=1000:width_type=q:width=1:gain=2"),
+            (
+                "aexciter",
+                "aexciter=amount=0.3:drive=6.0:blend=0:freq=6500:ceil=18000",
+            ),
+            ("virtualbass", "virtualbass=cutoff=120:strength=1.5"),
+            ("crossfeed", "crossfeed=strength=0.25:range=0.5"),
+            ("stereotools", "stereotools=slev=1.2"),
+            (
+                "aecho",
+                "aecho=in_gain=0.8:out_gain=0.9:delays=12|24|32:decays=0.05|0.04|0.03",
+            ),
+            (
+                "alimiter",
+                "alimiter=limit=0.89:level=disabled:asc=1:latency=1",
+            ),
+            ("asoftclip", "asoftclip=type=tanh:threshold=0.89:output=1"),
+        ];
+        let mut caps = FilterCaps::all();
+        let set = |af: &str| self.mpv().set_property("af", af).is_ok();
+        // Remember nothing: startup runs before any load, so empty is home.
+        for (key, af) in probes {
+            if !set(af) {
+                tracing::warn!(filter = key, "enhancer: filter missing, stage dropped");
+                match *key {
+                    "aformat" => caps.aformat = false,
+                    "highpass" => caps.highpass = false,
+                    "bass" => caps.bass = false,
+                    "treble" => caps.treble = false,
+                    "equalizer" => caps.equalizer = false,
+                    "aexciter" => caps.aexciter = false,
+                    "virtualbass" => caps.virtualbass = false,
+                    "crossfeed" => caps.crossfeed = false,
+                    "stereotools" => caps.stereotools = false,
+                    "aecho" => caps.aecho = false,
+                    "alimiter" => caps.alimiter = false,
+                    "asoftclip" => caps.asoftclip = false,
+                    _ => {}
+                }
+            }
+        }
+        let _ = set("");
+        if !caps.alimiter {
+            tracing::warn!("enhancer: no alimiter, enhancer disabled for safety");
+        }
+        *self.enhancer_caps.lock().unwrap() = caps;
+    }
+
     fn apply_af(&self) -> Result<(), Error> {
         let (gain_db, semitones) = *self.af.lock().unwrap();
-        self.mpv().set_property("af", af_chain(gain_db, semitones).as_str())?;
-        Ok(())
+        let enh = *self.enhancer.lock().unwrap();
+        let caps = *self.enhancer_caps.lock().unwrap();
+        let vol = self.decks.volume.load(Ordering::Relaxed);
+        let enh_af = build_enhancer_af(&enh, vol, &caps);
+        let full = full_af_chain(gain_db, semitones, &enh_af);
+        match self.mpv().set_property("af", full.as_str()) {
+            Ok(()) => Ok(()),
+            Err(e) if !enh_af.is_empty() => {
+                // The enhancer broke the chain (a filter this build rejects
+                // that probing missed, e.g. an option name drift). Never
+                // silence: disable the enhancer and restore gain+pitch.
+                tracing::warn!(error = %e, "enhancer chain refused, disabling enhancer");
+                self.enhancer.lock().unwrap().enabled = false;
+                let plain = af_chain(gain_db, semitones);
+                self.mpv().set_property("af", plain.as_str())?;
+                Ok(())
+            }
+            Err(e) => Err(e.into()),
+        }
     }
+}
+
+/// Merge gain + enhancer + pitch into one `af` value. Empty pieces are
+/// skipped so the default path stays exactly the filterless one.
+fn full_af_chain(gain_db: Option<f64>, semitones: i32, enhancer_af: &str) -> String {
+    // Reuse the tested gain/pitch fragments, then splice the enhancer
+    // between them: normalize first (consistent level in), pitch last.
+    let base = af_chain(gain_db, semitones);
+    if enhancer_af.is_empty() {
+        return base;
+    }
+    if base.is_empty() {
+        return enhancer_af.to_owned();
+    }
+    // base is "gain(,pitch)?": split pitch off when present so the enhancer
+    // lands between them rather than after the pitch shift.
+    if semitones != 0 {
+        let gain_only = af_chain(gain_db, 0);
+        let pitch_only = af_chain(None, semitones);
+        if gain_only.is_empty() {
+            return format!("{enhancer_af},{pitch_only}");
+        }
+        return format!("{gain_only},{enhancer_af},{pitch_only}");
+    }
+    format!("{base},{enhancer_af}")
 }
 
 /// The whole `af` chain: loudness gain, then pitch. Empty when neither is in play, so the default
@@ -1176,7 +1341,34 @@ fn perceptual_to_mpv(percent: i64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{af_chain, is_ao_init_failed, loadfile_args, perceptual_to_mpv, quoted};
+    use super::{af_chain, full_af_chain, is_ao_init_failed, loadfile_args, perceptual_to_mpv, quoted};
+
+    #[test]
+    fn enhancer_splices_between_gain_and_pitch_level_matched() {
+        // Empty enhancer keeps the exact filterless path (default OFF).
+        assert_eq!(full_af_chain(None, 0, ""), "");
+        assert_eq!(
+            full_af_chain(Some(-3.0), 0, ""),
+            "lavfi=[volume=-3dB]"
+        );
+        // Enhancer-only: the fragment passes through untouched.
+        assert_eq!(full_af_chain(None, 0, "alimiter=limit=0.89"), "alimiter=limit=0.89");
+        // Gain + enhancer: normalize first so the enhancer sees a
+        // consistent level, then the loudness-neutral enhancer chain.
+        let both = full_af_chain(Some(-4.0), 0, "aformat=sample_fmts=fltp,alimiter=limit=0.89");
+        assert_eq!(
+            both,
+            "lavfi=[volume=-4dB],aformat=sample_fmts=fltp,alimiter=limit=0.89"
+        );
+        // Gain + enhancer + pitch: enhancer sits between them, pitch last
+        // so the widening/room is not pitch-shifted twice.
+        let all = full_af_chain(Some(-4.0), 12, "alimiter=limit=0.89");
+        assert!(all.starts_with("lavfi=[volume=-4dB],alimiter=limit=0.89,rubberband="), "{}", all);
+        // Bypass (empty enhancer) restores the exact plain chain, so A/B
+        // compares at the same loudness apart from the preset trim that the
+        // enabled chain itself carries (within ~0.5 dB by design).
+        assert_eq!(full_af_chain(Some(-4.0), 12, ""), af_chain(Some(-4.0), 12));
+    }
 
     #[test]
     fn gain_and_pitch_share_one_chain() {
