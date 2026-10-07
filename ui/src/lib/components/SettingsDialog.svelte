@@ -75,6 +75,7 @@
 	import { appIcon, chooseAppIcon } from '$lib/appicon.svelte';
 	import GlobalHotkeysSettings from '$lib/components/GlobalHotkeysSettings.svelte';
 	import LyricsSourcesSettings from '$lib/components/LyricsSourcesSettings.svelte';
+	import EnhancerPanel from '$lib/components/EnhancerPanel.svelte';
 	import LanguagePicker from '$lib/components/LanguagePicker.svelte';
 
 	type TabId =
@@ -858,6 +859,10 @@
 									tall: true
 								})}
 							</div>
+						</section>
+						<section class={GROUP}>
+							<h3 class={LABEL}>Enhancer</h3>
+							<EnhancerPanel {settings} />
 						</section>
 						<section class={GROUP}>
 							<h3 class={LABEL}>{t('settings.sections.video')}</h3>
