@@ -319,16 +319,11 @@ pub fn build_enhancer_af(
     {
         let (bass_db, treble_db) = loudness_compensation_db(volume_percent, amt.loudness);
         if bass_db >= 0.05 && caps.bass {
-            parts.push(format!(
-                "@enh_loud_bass:bass=gain={}:frequency=120",
-                fmt_db(bass_db)
-            ));
+            parts.push(format!("@enh_loud_bass:bass=gain={}:frequency=120", fmt_db(bass_db)));
         }
         if treble_db >= 0.05 && caps.treble {
-            parts.push(format!(
-                "@enh_loud_treble:treble=gain={}:frequency=9000",
-                fmt_db(treble_db)
-            ));
+            parts
+                .push(format!("@enh_loud_treble:treble=gain={}:frequency=9000", fmt_db(treble_db)));
         }
     }
 
@@ -359,10 +354,7 @@ pub fn build_enhancer_af(
     // 4. Harmonic exciter, highs only, small blend.
     if amt.exciter > 0.0 && caps.aexciter {
         let amount = 0.3 * amt.exciter;
-        parts.push(format!(
-            "aexciter=amount={:.2}:drive=6.0:blend=0:freq=6500:ceil=18000",
-            amount
-        ));
+        parts.push(format!("aexciter=amount={:.2}:drive=6.0:blend=0:freq=6500:ceil=18000", amount));
     }
 
     // 5. Virtual bass, or a safe bass-shelf fallback.
@@ -434,10 +426,7 @@ mod tests {
     use super::*;
 
     fn on() -> EnhancerSettings {
-        EnhancerSettings {
-            enabled: true,
-            ..EnhancerSettings::default()
-        }
+        EnhancerSettings { enabled: true, ..EnhancerSettings::default() }
     }
 
     #[test]

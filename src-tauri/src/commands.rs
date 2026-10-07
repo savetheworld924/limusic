@@ -222,7 +222,7 @@ pub async fn get_queue(state: St<'_>) -> Result<serde_json::Value, String> {
 /// `visitor_data`) and internal blobs (`queue_json`, `queue_index`, `queue_position`) never cross
 /// into the webview: they'd otherwise ship the login credential to the renderer on every open, and
 /// the webview can't overwrite them either.
-const UI_SETTINGS: [&str; 29] = [
+const UI_SETTINGS: [&str; 34] = [
     "volume",
     "proxy",
     "quality",
@@ -252,6 +252,11 @@ const UI_SETTINGS: [&str; 29] = [
     "crossfade",
     "crossfade_secs",
     "locale",
+    "enhancer_enabled",
+    "enhancer_preset",
+    "enhancer_amounts",
+    "enhancer_output",
+    "enhancer_bypass",
 ];
 
 /// Resolve the music video for `video_id` and hand back a `limusicvideo://` URL the player view
@@ -428,6 +433,19 @@ pub async fn set_setting(
     // user is hearing right now: the switch exists so they can A/B the same loud section (#298).
     if key == "normalize_volume" {
         state.reapply_gain().await;
+    }
+    // Psychoacoustic enhancer: same immediacy as normalize_volume, so the
+    // master toggle, preset, sliders, output and A/B button are audible on
+    // the track that's already playing, not the next one.
+    if matches!(
+        key.as_str(),
+        "enhancer_enabled"
+            | "enhancer_preset"
+            | "enhancer_amounts"
+            | "enhancer_output"
+            | "enhancer_bypass"
+    ) {
+        state.apply_enhancer().await;
     }
     // The queue panel's switch sits right above the tracks it adds, so they come and go with it.
     // Spawned: turning it on can mean a radio fetch, and the switch shouldn't wait on the network.

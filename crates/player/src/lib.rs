@@ -15,8 +15,8 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 mod enhancer;
 pub use enhancer::{
-    build_enhancer_af, EnhancerAmounts, EnhancerOutput, EnhancerPresetName, EnhancerSettings,
-    FilterCaps, loudness_compensation_db, preset_trim_db,
+    build_enhancer_af, loudness_compensation_db, preset_trim_db, EnhancerAmounts, EnhancerOutput,
+    EnhancerPresetName, EnhancerSettings, FilterCaps,
 };
 mod video;
 pub use video::{GlDisplay, Thumbnail, VideoRenderer};
@@ -769,21 +769,12 @@ impl Player {
             ("bass", "bass=gain=2:frequency=120"),
             ("treble", "treble=gain=2:frequency=9000"),
             ("equalizer", "equalizer=frequency=1000:width_type=q:width=1:gain=2"),
-            (
-                "aexciter",
-                "aexciter=amount=0.3:drive=6.0:blend=0:freq=6500:ceil=18000",
-            ),
+            ("aexciter", "aexciter=amount=0.3:drive=6.0:blend=0:freq=6500:ceil=18000"),
             ("virtualbass", "virtualbass=cutoff=120:strength=1.5"),
             ("crossfeed", "crossfeed=strength=0.25:range=0.5"),
             ("stereotools", "stereotools=slev=1.2"),
-            (
-                "aecho",
-                "aecho=in_gain=0.8:out_gain=0.9:delays=12|24|32:decays=0.05|0.04|0.03",
-            ),
-            (
-                "alimiter",
-                "alimiter=limit=0.89:level=disabled:asc=1:latency=1",
-            ),
+            ("aecho", "aecho=in_gain=0.8:out_gain=0.9:delays=12|24|32:decays=0.05|0.04|0.03"),
+            ("alimiter", "alimiter=limit=0.89:level=disabled:asc=1:latency=1"),
             ("asoftclip", "asoftclip=type=tanh:threshold=0.89:output=1"),
         ];
         let mut caps = FilterCaps::all();
@@ -1341,25 +1332,21 @@ fn perceptual_to_mpv(percent: i64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{af_chain, full_af_chain, is_ao_init_failed, loadfile_args, perceptual_to_mpv, quoted};
+    use super::{
+        af_chain, full_af_chain, is_ao_init_failed, loadfile_args, perceptual_to_mpv, quoted,
+    };
 
     #[test]
     fn enhancer_splices_between_gain_and_pitch_level_matched() {
         // Empty enhancer keeps the exact filterless path (default OFF).
         assert_eq!(full_af_chain(None, 0, ""), "");
-        assert_eq!(
-            full_af_chain(Some(-3.0), 0, ""),
-            "lavfi=[volume=-3dB]"
-        );
+        assert_eq!(full_af_chain(Some(-3.0), 0, ""), "lavfi=[volume=-3dB]");
         // Enhancer-only: the fragment passes through untouched.
         assert_eq!(full_af_chain(None, 0, "alimiter=limit=0.89"), "alimiter=limit=0.89");
         // Gain + enhancer: normalize first so the enhancer sees a
         // consistent level, then the loudness-neutral enhancer chain.
         let both = full_af_chain(Some(-4.0), 0, "aformat=sample_fmts=fltp,alimiter=limit=0.89");
-        assert_eq!(
-            both,
-            "lavfi=[volume=-4dB],aformat=sample_fmts=fltp,alimiter=limit=0.89"
-        );
+        assert_eq!(both, "lavfi=[volume=-4dB],aformat=sample_fmts=fltp,alimiter=limit=0.89");
         // Gain + enhancer + pitch: enhancer sits between them, pitch last
         // so the widening/room is not pitch-shifted twice.
         let all = full_af_chain(Some(-4.0), 12, "alimiter=limit=0.89");

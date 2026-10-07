@@ -12,7 +12,7 @@ use innertube::{
     MAIN_CLIENT,
 };
 use listen_protocol::{Playback, PlaybackKind, Track};
-use player::Player;
+use player::{EnhancerAmounts, EnhancerOutput, EnhancerPresetName, EnhancerSettings, Player};
 use tauri::{AppHandle, Emitter};
 use tokio::sync::Mutex;
 
@@ -3347,6 +3347,23 @@ impl AppState {
         self.player.set_crossfade(secs);
     }
 
+    /// Put the persisted enhancer settings on the player, effective on what
+    /// is already playing (like `reapply_gain`, unlike crossfade). Every
+    /// `enhancer_*` writer in `set_setting` routes through here. Never fails
+    /// playback: a refused chain disables the enhancer inside the player and
+    /// leaves gain+pitch intact.
+    pub async fn apply_enhancer(&self) {
+        // A/B is momentary: if the UI left it on, the next write still
+        // carries it once, then it clears. Startup always resets it.
+        let mut settings = load_enhancer_settings(&self.db);
+        if self.db.get_setting("enhancer_bypass").as_deref() == Some("true") {
+            settings.bypass = true;
+        }
+        if let Err(e) = self.player.set_enhancer(settings) {
+            tracing::warn!(error = %e, "applying enhancer settings failed");
+        }
+    }
+
     /// Host: seed a freshly-created room with whatever we're currently playing.
     async fn lt_host_seed(&self) {
         let position_ms = (self.current_position() * 1000.0) as i64;
@@ -4360,6 +4377,64 @@ pub fn saved_crossfade(db: &Db) -> Option<f64> {
     }
     let secs = db.get_setting("crossfade_secs").and_then(|s| s.parse::<f64>().ok());
     Some(secs.filter(|s| s.is_finite()).unwrap_or(5.0).clamp(1.0, 10.0))
+}
+
+/// Psychoacoustic enhancer state from the five `enhancer_*` settings.
+/// Default is OFF with the Subtle preset, so existing behavior is unchanged.
+/// `enhancer_bypass` (A/B) always loads as false: a comparison never carries
+/// over a restart. A corrupt `enhancer_amounts` blob falls back to its
+/// preset defaults rather than failing the player.
+pub fn load_enhancer_settings(db: &Db) -> EnhancerSettings {
+    let enabled = db.get_setting("enhancer_enabled").as_deref() == Some("true");
+    let preset =
+        EnhancerPresetName::parse(db.get_setting("enhancer_preset").as_deref().unwrap_or("Subtle"));
+    let output =
+        EnhancerOutput::parse(db.get_setting("enhancer_output").as_deref().unwrap_or("speakers"));
+    let amounts = db
+        .get_setting("enhancer_amounts")
+        .and_then(|s| parse_enhancer_amounts(&s, preset))
+        .unwrap_or_else(|| EnhancerAmounts::from_preset(preset));
+    EnhancerSettings { enabled, bypass: false, preset, amounts, output }
+}
+
+/// Parse the `enhancer_amounts` JSON blob (`{"loudness":0.6,...}`).
+/// Returns `None` on any shape error so the caller falls back to presets.
+fn parse_enhancer_amounts(s: &str, preset: EnhancerPresetName) -> Option<EnhancerAmounts> {
+    let v: serde_json::Value = serde_json::from_str(s).ok()?;
+    let o = v.as_object()?;
+    let num = |k: &str| o.get(k).and_then(serde_json::Value::as_f64).map(|x| x as f32);
+    // All six stages required: a half-written blob is a bug, not a preset.
+    Some(
+        EnhancerAmounts {
+            loudness: num("loudness")?,
+            polish: num("polish")?,
+            exciter: num("exciter")?,
+            virtual_bass: num("virtual_bass")?,
+            stereo: num("stereo")?,
+            room: num("room")?,
+        }
+        .sanitized(),
+    )
+    .filter(|_| {
+        // Guard against a preset rename leaving a stale blob behind: the
+        // blob is still usable (it carries its own values), so accept it.
+        let _ = preset;
+        true
+    })
+}
+
+/// Serialize amounts for `set_setting("enhancer_amounts", …)`. Used by tests
+/// and (via the UI) when a preset is picked.
+pub fn enhancer_amounts_json(a: &EnhancerAmounts) -> String {
+    serde_json::json!({
+        "loudness": a.loudness,
+        "polish": a.polish,
+        "exciter": a.exciter,
+        "virtual_bass": a.virtual_bass,
+        "stereo": a.stereo,
+        "room": a.room,
+    })
+    .to_string()
 }
 
 /// How far into a track a play counts (context/01 §registerPlayback): halfway, capped at 30s.

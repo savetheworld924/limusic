@@ -517,6 +517,12 @@ pub fn run() {
                 hotkeys::LAST_NONZERO_VOLUME.store(volume, std::sync::atomic::Ordering::Relaxed);
             }
             player.set_crossfade(state::saved_crossfade(&db));
+            // Enhancer defaults to OFF; A/B never survives a restart.
+            db.set_setting("enhancer_bypass", "false");
+            let enh = state::load_enhancer_settings(&db);
+            if let Err(e) = player.set_enhancer(enh) {
+                tracing::warn!(error = %e, "enhancer startup apply failed (continuing off)");
+            }
             let events = match player.take_events() {
                 Some(ev) => ev,
                 None => fatal(
