@@ -172,6 +172,12 @@ jobs:
       # just emits `cargo:rustc-link-lib=mpv` (pregenerated bindings, no headers needed).
       - name: Build the libmpv import library
         shell: pwsh
+        # Scoped to this step only: authenticates the shinchiro release lookup below
+        # (anonymous API quota is shared per runner egress IP and rate-limits).
+        # Nothing else in the job sees it, and it is the auto-provisioned
+        # GITHUB_TOKEN, not a stored secret.
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           $ErrorActionPreference = "Stop"
           New-Item -ItemType Directory -Force -Path "$env:MPV_DIR" | Out-Null
@@ -182,11 +188,24 @@ jobs:
             # The pin 404s when shinchiro prunes the release (seen 2026-10-07): fall back to the
             # newest daily's plain x86_64 package (never -v3-, which needs AVX2).
             Write-Host "::warning::pinned MPV_DEV_URL failed, resolving the newest mpv-dev asset"
-            $rel = Invoke-RestMethod "https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases/latest"
-            $asset = $rel.assets | Where-Object { $_.name -match '^mpv-dev-x86_64-\d+-git-[0-9a-f]+\.7z$' } | Select-Object -First 1
-            if (-not $asset) { throw "no mpv-dev-x86_64 asset in the latest shinchiro release" }
-            Write-Host "falling back to $($asset.name)"
-            curl.exe -fsSL -o "$env:MPV_DIR\mpv-dev.7z" $asset.browser_download_url
+            $fallbackUrl = $null
+            try {
+              $rel = Invoke-RestMethod "https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases/latest" `
+                -Headers @{ Authorization = "Bearer $env:GH_TOKEN" }
+              $asset = $rel.assets | Where-Object { $_.name -match '^mpv-dev-x86_64-\d+-git-[0-9a-f]+\.7z$' } | Select-Object -First 1
+              if ($asset) { $fallbackUrl = $asset.browser_download_url }
+            } catch {
+              Write-Host ("::warning::shinchiro release lookup failed: " + $_.Exception.Message)
+            }
+            if (-not $fallbackUrl) {
+              # Last resort: a known-good daily, verified 2026-10-07 (plain x86_64, not -v3-).
+              # Rots the same way the pin did if pruned; the lookup above is the durable path.
+              $fallbackUrl = "https://github.com/shinchiro/mpv-winbuild-cmake/releases/download/20261007/mpv-dev-x86_64-20261007-git-eb0ee10315.7z"
+              Write-Host "::warning::using last-resort mpv-dev URL $fallbackUrl"
+            } else {
+              Write-Host "falling back to $($asset.name)"
+            }
+            curl.exe -fsSL -o "$env:MPV_DIR\mpv-dev.7z" $fallbackUrl
             if ($LASTEXITCODE -ne 0) { throw "fallback mpv-dev download failed" }
           } else {
             Write-Host "downloaded the pinned mpv-dev package"
