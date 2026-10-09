@@ -175,10 +175,10 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           New-Item -ItemType Directory -Force -Path "$env:MPV_DIR" | Out-Null
-          try {
-            curl.exe -fsSL -o "$env:MPV_DIR\mpv-dev.7z" "$env:MPV_DEV_URL"
-            Write-Host "downloaded the pinned mpv-dev package"
-          } catch {
+          # NOTE: curl.exe is a native command, so a 404 exit code does NOT throw under
+          # $ErrorActionPreference (that only affects cmdlets). Gate on $LASTEXITCODE.
+          curl.exe -fsSL -o "$env:MPV_DIR\mpv-dev.7z" "$env:MPV_DEV_URL"
+          if ($LASTEXITCODE -ne 0) {
             # The pin 404s when shinchiro prunes the release (seen 2026-10-07): fall back to the
             # newest daily's plain x86_64 package (never -v3-, which needs AVX2).
             Write-Host "::warning::pinned MPV_DEV_URL failed, resolving the newest mpv-dev asset"
@@ -187,6 +187,9 @@ jobs:
             if (-not $asset) { throw "no mpv-dev-x86_64 asset in the latest shinchiro release" }
             Write-Host "falling back to $($asset.name)"
             curl.exe -fsSL -o "$env:MPV_DIR\mpv-dev.7z" $asset.browser_download_url
+            if ($LASTEXITCODE -ne 0) { throw "fallback mpv-dev download failed" }
+          } else {
+            Write-Host "downloaded the pinned mpv-dev package"
           }
           7z x "$env:MPV_DIR\mpv-dev.7z" -o"$env:MPV_DIR" -y | Out-Null
           if (-not (Test-Path "$env:MPV_DIR\libmpv-2.dll")) { throw "libmpv-2.dll not found in the dev package — did the package layout change?" }
