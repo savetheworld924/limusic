@@ -250,17 +250,29 @@ jobs:
           # to the filesystem. A release candidate builds the NSIS installer only: the updater
           # never uses the MSI, and WiX refuses a version whose prerelease suffix isn't numeric.
           BUNDLES=(); [ "${{ steps.ver.outputs.prerelease }}" = false ] || BUNDLES=(--bundles nsis)
-          tauri build "${BUNDLES[@]}" --config '{"build":{"beforeBuildCommand":""}}'   # → target/release/bundle/{nsis,msi}/
+          # createUpdaterArtifacts=false: with no private key, tauri fails the build after the
+          # installers are already produced ("public key found, but no private key"). The .sig
+          # sidecars are only for the updater, which ignores unsigned builds anyway.
+          tauri build "${BUNDLES[@]}" --config '{"build":{"beforeBuildCommand":""},"bundle":{"createUpdaterArtifacts":false}}'   # → target/release/bundle/{nsis,msi}/
           echo "unsigned installers built (no .sig files — the updater ignores these builds)"
 
       # Workflow artifacts, not release assets: anyone with repo access downloads them from the
       # run's page, no user is ever offered them as an update, and latest.json is untouched.
-      - name: Upload the installers as a workflow artifact
+      # The setup exe is required (error if missing); the MSI only exists for stable
+      # versions (prereleases build NSIS only), so it must never fail the job.
+      - name: Upload the setup exe as a workflow artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: limusic-unsigned-${{ inputs.ref }}-${{ steps.ver.outputs.version }}
-          path: |
-            target/release/bundle/nsis/*-setup.exe
-            target/release/bundle/msi/*.msi
+          path: target/release/bundle/nsis/*-setup.exe
           if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload the MSI as a workflow artifact (stable versions only)
+        if: ${{ steps.ver.outputs.prerelease == 'false' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: limusic-unsigned-${{ inputs.ref }}-${{ steps.ver.outputs.version }}-msi
+          path: target/release/bundle/msi/*.msi
+          if-no-files-found: warn
           retention-days: 14
